@@ -1,0 +1,242 @@
+\documentclass{scrartcl}
+\usepackage{amsmath, amsfonts, amssymb,}
+\usepackage{natbib}
+\usepackage[english]{babel}
+\title{SimCode reimplemented}
+\author{Matthijs den Besten}
+\begin{document}
+\SweaveOpts{concordance=TRUE}
+
+
+\maketitle
+\begin{abstract}
+  Implementation of SimCode \citep{DD08} with help of the igraph package \citep{CN06} in R \citep{R}.
+  \end{abstract}
+\section{Structure of the model}
+The model consists of $n$ developers and $m$ modules. Each module is linked to (one) parent module. Together the modules constitute a tree.
+
+<<>>=
+require(igraph)
+
+# developers do not seem to serve any purpose yet
+CodeTree <- setRefClass("CodeTree", 
+                        fields = c("developers", "tree", "parameters"));
+
+
+@
+
+\section{Simulation procedure}
+In each step
+\begin{itemize}
+\item A contribution is drawn from a random distribution
+\item The rewards of existing and potential modules are computed
+\item A module is chosen and the system is modified.
+\end{itemize}
+
+\subsection{Size of contributions}
+The size of the contributions is determined with help of an exponential random number generator according to the following formula.
+\begin{equation}
+\alpha = - \frac{1}{\delta}\ln(1 - \rho)
+\end{equation}, where $\rho$ is uniformly distributed and $\delta$ controls the mean of the distribution.
+
+<<>>=
+draw.contribution <- function(n, delta) {
+  return(rexp(n, delta));
+}
+@
+
+\subsection{Expected rewards}
+\begin{equation}
+r_m(x_m) = r_{d_m}(x_m) = v_{d_m}(x_m)d_m^{-\lambda}\left((1+c_m)^{\gamma}\right)
+\end{equation}
+
+$d_m$ is the distance of module $m$ from the first "root" module ($+1$ in order to make sure the equation above always returns a number)
+
+<<>>=
+get.depth <- function(g, root = 1) {
+  return(shortest.paths(g, root, V(g)) + 1);
+}
+@
+
+$v_{d_m}(x_m)$ gives the version number of model $m$ at distance $d_m$ according to function 
+\begin{equation}
+v_{d_m} (x_m) = \log \left(1 + x_md_m^\mu\right)
+\end{equation}
+
+<<>>=
+get.version <- function(x, d, mu) {
+  stopifnot(mu >= 0)
+  return(log(1+x*d^mu));
+}
+
+get.improvement <- function(g) {
+  return(V(g)$x)
+}
+@
+
+
+$c_m$ is the number of contributions received by module $m$.
+
+<<>>=
+get.contributions <- function(g) {
+  return(V(g)$c);
+}
+@
+
+$\lambda \geq 0$ and $\gamma \geq 0$ are parameters.
+
+<<>>=
+get.reward <- function(g, xm = get.improvement(g), lambda, gamma, mu) {
+  stopifnot(lambda >= 0);
+  stopifnot(gamma >= 0);
+  dm <- get.depth(g);
+  vdm <- mapply(get.version, xm, dm, mu);
+  cm <- get.contributions(g);
+  return(vdm*dm^-lambda*((1+cm)^gamma));
+}
+@
+
+\begin{equation}
+\forall m: p_m'(\alpha) = r_m'(\alpha) = r_{d_m+1}(\alpha) = v_{d_m+1}(\alpha)(d_m + 1)^{-\lambda}
+\end{equation}
+<<>>=
+get.expected.virtual.reward <- function(alpha, g, lambda, mu, ...) {
+  dm <- get.depth(g);
+  vdm.prime <- mapply(get.version, alpha, dm, mu);
+  return(vdm.prime*(dm+1)^-lambda);
+}
+@
+
+
+\subsection{Module selection}
+
+\begin{equation}
+P[\textrm{chosen module} = \textrm{module } m(m')] = \frac{\rho_m(\alpha)}{\sum_{m=1}^{\textrm{all modules}} \rho_m(\alpha) + \sum_{m'=1}^{\textrm{all virtual modules}} \rho_{m'}(\alpha)}
+\end{equation}
+
+<<>>=
+get.module.preference <- function(alpha, g, ...) {
+  rhom <- get.expected.reward(alpha, g, ...);
+  rhom.prime <- get.expected.virtual.reward(alpha, g, ...);
+  return(c(rhom, rhom.prime)/(sum(rhom)+sum(rhom.prime)));
+}
+@
+
+\begin{equation}
+\forall m: \rho_m(alpha) = r_m(x_m + \alpha) - r_m(x_m)
+\end{equation}
+
+<<>>=
+get.expected.reward <- function(alpha, g, ...) {
+  xm <- get.improvement(g);
+  return(get.reward(g, xm + alpha, ...) - get.reward(g, xm, ...));
+}
+@
+
+
+
+\section{Simulation}
+To grow the tree, perform the operation detailed above.
+<<>>=
+CodeTree$methods(grow = function() {
+  contribution <- draw.contribution(1, parameters$delta);
+  module.utility <- get.module.preference(contribution, tree,
+                                         gamma = parameters$gamma,
+                                         lambda = parameters$lambda,
+                                         mu = parameters$mu);
+ 
+  m <- vcount(tree);
+  module.selection <- sample(1:(m*2), 1, prob = module.utility);
+  if(module.selection <= m) {
+    V(tree)[module.selection]$c <<- V(tree)[module.selection]$c + 1;
+    V(tree)[module.selection]$x <<- V(tree)[module.selection]$x + contribution;
+  } else {
+    module.label <- as.character(m+1);
+    module.parent <- module.selection - m;
+    tree <<- tree + vertex(label=module.label, c = 1, x = contribution);
+    tree <<- tree + edge(module.parent, m+1);
+    
+  }
+});
+
+@
+
+Set the parameters of the model at initialization. Start with a root module without prior contributions.
+
+<<>>=
+CodeTree$methods(initialize = function(gamma = 1,
+                                       lambda = 1,
+                                       delta = 3,
+                                       mu = .5,
+                                       theta = .5,
+                                       xi = 2) {
+  # what is the use of theta and xi?
+  parameters <<- list(gamma = gamma,
+                      lambda = lambda,
+                      delta = delta,
+                      mu = mu,
+                      theta = theta,
+                      xi = xi);
+  tree <<- graph.empty() + vertex(label="Root",  x = 0, c=0);
+  
+  return(.self);
+});
+@
+
+\section{Exploraton}
+\subsection{First test}
+Plant a tree let it grow.
+
+<<fig=TRUE>>=
+t1 <- CodeTree$new();
+par(mfrow=c(3,3));
+for(i in 1:9) { 
+  t1$grow(); 
+  t1$grow(); 
+  plot(t1$tree, layout=layout.reingold.tilford(t1$tree, root=1, flip.y=FALSE), 
+       vertex.size = V(t1$tree)$x*10, 
+       main=bquote(lambda==.(t1$parameters$lambda)~ 
+         ~gamma== .(t1$parameters$gamma)~(.(sum(V(t1$tree)$c)))));
+}
+@
+
+\subsection{Kinds of trees}
+
+Create ideal types.
+
+<<>>=
+vonHippel <- CodeTree$new(gamma = 0, lambda = 0);
+lernerTir <- CodeTree$new(gamma = 0, lambda = 2);
+socialHac <- CodeTree$new(gamma = 2, lambda = 2);
+skillImpr <- CodeTree$new(gamma = 2, lambda = 0);
+@ 
+
+Let them grow for ten iterations.
+<<>>=
+for(i in 1:10) {
+  vonHippel$grow();
+  lernerTir$grow();
+  socialHac$grow();
+  skillImpr$grow();
+}
+@
+
+Plot the result
+<<fig=TRUE>>=
+par(mfrow=c(2,2));
+for(ct in list(lernerTir, socialHac, vonHippel, skillImpr)) {
+  plot(ct$tree, layout=layout.reingold.tilford(ct$tree, root=1, flip.y=FALSE), 
+       vertex.size = V(ct$tree)$x*10, 
+       sub=bquote(lambda==.(ct$parameters$lambda)~ 
+         ~gamma== .(ct$parameters$gamma))); 
+}
+@ 
+
+% apTreeshape R package
+% Sackin statistic
+% Yule
+
+\bibliography{simcode}
+\bibliographystyle{apalike}
+
+\end{document}
